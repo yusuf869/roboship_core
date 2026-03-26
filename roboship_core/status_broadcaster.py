@@ -4,7 +4,7 @@ from rclpy.node import Node
 class StatusBroadcaster(Node):
     def __init__(self):
         super().__init__('system_status_node')
-        self.get_logger().info('Roboship Core Systems: ONLINE. Awaiting Pixhawk Connection...')
+        self.get_logger().info('AAAAAAA')
 
 def main(args=None):
     rclpy.init(args=args)
