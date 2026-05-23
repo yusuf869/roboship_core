@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+ilos_guidance.py - Integral Line-of-Sight guidance for Roboship USV
+
+References
+----------
+[1] Lekkas, A. M., & Fossen, T. I. (2014). "Integral LOS Path Following for
+    Curved Paths Based on a Constant Bearing Guidance Law." IEEE Transactions
+    on Control Systems Technology, 22(6), 2287-2301.
+
+Architecture
+------------
+Pattern B: publishes geometry_msgs/Twist on
+/mavros/setpoint_velocity/cmd_vel_unstamped while in GUIDED mode.
+ArduRover's inner speed and yaw-rate loops execute the commands.
+EKF3 (fed by Qualisys via /mavros/vision_pose/pose -> ExternalNav) provides
+the state on /mavros/local_position/odom.
+"""
+
+import csv
+import json
+import math
+from datetime import datetime
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+from geometry_msgs.msg import Twist
+from geographic_msgs.msg import GeoPointStamped
+from mavros_msgs.msg import State
+from nav_msgs.msg import Odometry
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def quat_to_yaw(q) -> float:
+    """Extract yaw from a geometry_msgs/Quaternion (ENU frame)."""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def wrap_angle(a: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def dist_point_to_segment(px, py, x1, y1, x2, y2):
+    """Shortest distance from point (px, py) to line segment (x1,y1)-(x2,y2).
+    Returns (distance, nearest_x, nearest_y)."""
+    dx, dy = x2 - x1, y2 - y1
+    len_sq = dx * dx + dy * dy
+    if len_sq < 1e-12:
+        return math.hypot(px - x1, py - y1), x1, y1
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / len_sq))
+    cx = x1 + t * dx
+    cy = y1 + t * dy
+    return math.hypot(px - cx, py - cy), cx, cy
+
+
+# -----------------------------------------------------------------------------
+# Polygon geometry
+# -----------------------------------------------------------------------------
+
+class BoundaryPolygon:
+    """Precomputed polygon boundary with signed distance queries."""
+
+    def __init__(self, vertices: list, margin: float):
+        self.verts = list(vertices)
+        self.n = len(self.verts)
+        self.margin = margin
+
+        if self.n < 3:
+            raise ValueError(f'Polygon needs >= 3 vertices, got {self.n}')
+
+        area2 = 0.0
+        for i in range(self.n):
+            x1, y1 = self.verts[i]
+            x2, y2 = self.verts[(i + 1) % self.n]
+            area2 += x1 * y2 - x2 * y1
+        sign = 1.0 if area2 > 0.0 else -1.0
+
+        self.edges = []
+        for i in range(self.n):
+            x1, y1 = self.verts[i]
+            x2, y2 = self.verts[(i + 1) % self.n]
+            edx, edy = x2 - x1, y2 - y1
+            length = math.sqrt(edx * edx + edy * edy)
+            if length < 1e-9:
+                continue
+            nx = sign * (-edy) / length
+            ny = sign * (edx) / length
+            self.edges.append((x1, y1, x2, y2, nx, ny))
+
+    def point_inside(self, px: float, py: float) -> bool:
+        inside = False
+        j = self.n - 1
+        for i in range(self.n):
+            xi, yi = self.verts[i]
+            xj, yj = self.verts[j]
+            if ((yi > py) != (yj > py)) and \
+               (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def signed_distance(self, px: float, py: float):
+        min_dist = float('inf')
+        nearest_idx = 0
+        for i, (x1, y1, x2, y2, _nx, _ny) in enumerate(self.edges):
+            d, _, _ = dist_point_to_segment(px, py, x1, y1, x2, y2)
+            if d < min_dist:
+                min_dist = d
+                nearest_idx = i
+        if not self.point_inside(px, py):
+            min_dist = -min_dist
+        return min_dist, nearest_idx
+
+    def speed_factor(self, px, py, heading_rad):
+        sd, nearest_idx = self.signed_distance(px, py)
+        if sd <= 0.0:
+            return 0.0, sd, nearest_idx
+        if sd >= self.margin:
+            return 1.0, sd, nearest_idx
+        factor = sd / self.margin
+        _, _, _, _, nx, ny = self.edges[nearest_idx]
+        hx = math.cos(heading_rad)
+        hy = math.sin(heading_rad)
+        dot = hx * nx + hy * ny
+        if dot < 0.0:
+            factor *= (1.0 + dot)
+        return max(factor, 0.0), sd, nearest_idx
+
+
+# -----------------------------------------------------------------------------
+# Main node
+# -----------------------------------------------------------------------------
+
+class ILOSGuidance(Node):
+    def __init__(self):
+        super().__init__('ilos_guidance')
+
+        # ---- Guidance parameters -------------------------------------------
+        self.declare_parameter('waypoints',
+                               [0.5, 0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5] * 3)
+        self.declare_parameter('U_desired', 0.20)
+        self.declare_parameter('U_min', 0.05)
+        self.declare_parameter('lookahead_min', 0.5)
+        self.declare_parameter('lookahead_max', 2.0)
+        self.declare_parameter('lookahead_gain', 1.0)
+        self.declare_parameter('kappa', 0.05)
+        self.declare_parameter('y_int_sat', 0.15)  # REPLACED beta_sat
+        self.declare_parameter('K_psi', 1.5)
+        self.declare_parameter('acceptance_radius', 0.2)
+        self.declare_parameter('braking_distance', 1.0)
+        self.declare_parameter('control_rate', 20.0)
+        self.declare_parameter('loop_mission', False)
+
+        # ---- Polygon boundary ----------------------------------------------
+        default_boundary_file = '/home/roboship/ros2_ws/src/roboship_core/roboship_core/navigation_scripts/mocap_boundary.json'
+        self.declare_parameter('boundary_file', default_boundary_file)
+        self.declare_parameter('boundary_margin', 0.3)
+
+        # ---- Logging -------------------------------------------------------
+        self.declare_parameter('log_csv', True)
+        self.declare_parameter('log_dir', str(Path.home() / 'roboship_logs'))
+
+        # ---- Load params ---------------------------------------------------
+        wp_flat = self.get_parameter('waypoints').value
+        if len(wp_flat) < 4 or len(wp_flat) % 2 != 0:
+            raise ValueError(f'waypoints must be even-length, got {len(wp_flat)}')
+        self.waypoints = [(wp_flat[i], wp_flat[i + 1])
+                          for i in range(0, len(wp_flat), 2)]
+
+        self.U_d         = float(self.get_parameter('U_desired').value)
+        self.U_min       = float(self.get_parameter('U_min').value)
+        self.D_min       = float(self.get_parameter('lookahead_min').value)
+        self.D_max       = float(self.get_parameter('lookahead_max').value)
+        self.D_gain      = float(self.get_parameter('lookahead_gain').value)
+        self.kappa       = float(self.get_parameter('kappa').value)
+        self.y_int_sat   = float(self.get_parameter('y_int_sat').value) # UPDATED
+        self.K_psi       = float(self.get_parameter('K_psi').value)
+        self.R_accept    = float(self.get_parameter('acceptance_radius').value)
+        self.brake_dist  = float(self.get_parameter('braking_distance').value)
+        self.rate_hz     = float(self.get_parameter('control_rate').value)
+        self.loop_mode   = bool(self.get_parameter('loop_mission').value)
+
+        # ---- Load JSON boundary file ---------------------------------------
+        b_margin = float(self.get_parameter('boundary_margin').value)
+        boundary_file_path = Path(self.get_parameter('boundary_file').value)
+        self.boundary = None
+        bv_flat = []
+
+        if boundary_file_path.is_file():
+            try:
+                with open(boundary_file_path, 'r') as f:
+                    data = json.load(f)
+                    for pt in data.get('boundary_points', []):
+                        bv_flat.extend([pt['x'], pt['y']])
+                self.get_logger().info(
+                    f'Loaded boundary from {boundary_file_path.name}')
+            except Exception as e:
+                self.get_logger().error(
+                    f'Failed to parse {boundary_file_path.name}: {e}')
+        else:
+            self.get_logger().info(
+                f'No boundary file at {boundary_file_path}.')
+
+        if len(bv_flat) >= 6 and len(bv_flat) % 2 == 0:
+            verts = [(bv_flat[i], bv_flat[i + 1])
+                     for i in range(0, len(bv_flat), 2)]
+            self.boundary = BoundaryPolygon(verts, b_margin)
+            self.get_logger().info(
+                f'Boundary active: {len(verts)} vertices, '
+                f'margin={b_margin:.2f} m')
+            for i, (wx, wy) in enumerate(self.waypoints):
+                if not self.boundary.point_inside(wx, wy):
+                    self.get_logger().warn(
+                        f'WP {i} ({wx:.2f}, {wy:.2f}) OUTSIDE boundary!')
+                else:
+                    sd, _ = self.boundary.signed_distance(wx, wy)
+                    if sd < b_margin:
+                        self.get_logger().warn(
+                            f'WP {i} ({wx:.2f}, {wy:.2f}) within '
+                            f'{b_margin:.2f} m margin (dist={sd:.2f} m).')
+        else:
+            self.get_logger().warn(
+                'Boundary disabled. Valid polygon data not found.')
+
+        # ---- State ----------------------------------------------------------
+        self.x = self.y = self.psi = 0.0
+        self.u = self.v = 0.0
+        self.have_state = False
+
+        self.mode = ''
+        self.armed = False
+
+        self.wp_idx = 0
+        self.y_int = 0.0  # UPDATED: was beta_hat
+        self.start_pose = None
+        self.mission_complete = False
+        self.origin_set = False
+
+        self.last_time = self.get_clock().now()
+
+        # ---- QoS for MAVROS topics -----------------------------------------
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        # ---- ROS interfaces -------------------------------------------------
+        self.create_subscription(
+            Odometry, '/mavros/local_position/odom', self._odom_cb, sensor_qos)
+        self.create_subscription(
+            State, '/mavros/state', self._state_cb, 10)
+
+        self.cmd_pub = self.create_publisher(
+            Twist, '/mavros/setpoint_velocity/cmd_vel_unstamped', 10)
+
+        self.origin_pub = self.create_publisher(
+            GeoPointStamped, '/mavros/global_position/set_gp_origin', 10)
+
+        # ---- Global origin timer (1 Hz until EKF has pose) -----------------
+        self.origin_timer = self.create_timer(1.0, self._set_origin)
+
+        # ---- CSV logging ----------------------------------------------------
+        self.log_enabled = bool(self.get_parameter('log_csv').value)
+        self.csv_file = None
+        if self.log_enabled:
+            log_dir = Path(self.get_parameter('log_dir').value)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.csv_path = log_dir / f'ilos_{ts}.csv'
+            self.csv_file = open(self.csv_path, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow([
+                't', 'x', 'y', 'psi', 'u', 'v',
+                'wp_idx', 'wp_target_x', 'wp_target_y',
+                'alpha_k', 'x_e', 'y_e',
+                'lookahead', 'y_int',  # UPDATED CSV HEADER
+                'psi_d', 'psi_err', 'U_cmd', 'r_cmd',
+                'bound_factor', 'min_wall_dist',
+            ])
+            self.get_logger().info(f'Logging to {self.csv_path}')
+
+        # ---- Control timer --------------------------------------------------
+        self.timer = self.create_timer(1.0 / self.rate_hz, self._control_loop)
+        self.get_logger().info(
+            f'ILOS started. {len(self.waypoints)} waypoints, '
+            f'U_d={self.U_d} m/s, kappa={self.kappa}, '
+            f'lookahead=[{self.D_min}, {self.D_max}] m')
+
+    # ------------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------------
+
+    def _state_cb(self, msg: State):
+        new_mode = msg.mode
+        if new_mode != self.mode:
+            self.get_logger().info(f'Mode: {self.mode!r} -> {new_mode!r}')
+            if new_mode == 'GUIDED':
+                self._reset_mission()
+            elif self.mode == 'GUIDED':
+                self.get_logger().info('Left GUIDED. Sending zero command.')
+                self._publish_zero()
+        self.mode = new_mode
+        self.armed = msg.armed
+
+    def _odom_cb(self, msg: Odometry):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        self.psi = quat_to_yaw(msg.pose.pose.orientation)
+        vx_w = msg.twist.twist.linear.x
+        vy_w = msg.twist.twist.linear.y
+        c, s = math.cos(self.psi), math.sin(self.psi)
+        self.u =  c * vx_w + s * vy_w
+        self.v = -s * vx_w + c * vy_w
+        self.have_state = True
+
+    # ------------------------------------------------------------------------
+    # ILOS core math
+    # ------------------------------------------------------------------------
+
+    def _path_errors(self, wp_prev, wp_target):
+        xk, yk = wp_prev
+        xk1, yk1 = wp_target
+        alpha_k = math.atan2(yk1 - yk, xk1 - xk)
+        dx = self.x - xk
+        dy = self.y - yk
+        c, s = math.cos(alpha_k), math.sin(alpha_k)
+        x_e =  c * dx + s * dy
+        y_e = -s * dx + c * dy
+        return alpha_k, x_e, y_e
+
+    def _adaptive_lookahead(self, y_e: float) -> float:
+        return ((self.D_max - self.D_min)
+                * math.exp(-self.D_gain * abs(y_e))
+                + self.D_min)
+
+    def _ilos_desired_heading(self, alpha_k, y_e, Delta, dt) -> float:
+        denom = math.sqrt(Delta * Delta + (y_e + self.y_int) ** 2)
+        y_int_dot = self.kappa * Delta * y_e / denom
+        self.y_int += y_int_dot * dt
+        if self.y_int > self.y_int_sat:
+            self.y_int = self.y_int_sat
+        elif self.y_int < -self.y_int_sat:
+            self.y_int = -self.y_int_sat
+        return alpha_k - math.atan2(y_e + self.y_int, Delta)
+
+    # ------------------------------------------------------------------------
+    # Mission management
+    # ------------------------------------------------------------------------
+
+    def _reset_mission(self):
+        self.mission_complete = False
+        self.y_int = 0.0
+
+        if self.have_state:
+            self.start_pose = (self.x, self.y)
+            min_dist = float('inf')
+            closest_idx = 0
+            for i, (wx, wy) in enumerate(self.waypoints):
+                d = math.hypot(wx - self.x, wy - self.y)
+                if d < min_dist:
+                    min_dist = d
+                    closest_idx = i
+            self.wp_idx = closest_idx
+            self._first_wp_idx = closest_idx
+            self.get_logger().info(
+                f'Mission reset. Nearest WP {closest_idx} '
+                f'({self.waypoints[closest_idx][0]:.2f}, '
+                f'{self.waypoints[closest_idx][1]:.2f}), '
+                f'dist={min_dist:.2f} m')
+        else:
+            self.start_pose = None
+            self.wp_idx = 0
+            self._first_wp_idx = 0
+            self.get_logger().info('Mission reset (no state yet, defaulting to WP 0).')
+
+    def _advance_waypoint(self):
+        self.wp_idx += 1
+        self.y_int = 0.0
+        if self.wp_idx >= len(self.waypoints):
+            if self.loop_mode:
+                self.wp_idx = 0
+                self.get_logger().info('Mission looping back to WP 0.')
+            else:
+                self.mission_complete = True
+                self.get_logger().info('Mission complete.')
+
+    def _publish_zero(self):
+        self.cmd_pub.publish(Twist())
+
+    # ------------------------------------------------------------------------
+    # Main control loop
+    # ------------------------------------------------------------------------
+
+    def _control_loop(self):
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds * 1e-9
+        self.last_time = now
+        if dt <= 0.0 or dt > 0.5:
+            return
+
+        if not self.have_state:
+            return
+        if self.mode != 'GUIDED' or not self.armed:
+            self._publish_zero()
+            return
+        if self.mission_complete:
+            self._publish_zero()
+            return
+        if self.start_pose is None:
+            self.start_pose = (self.x, self.y)
+
+        wp_target = self.waypoints[self.wp_idx]
+        wp_prev = (self.start_pose if self.wp_idx == self._first_wp_idx
+                   else self.waypoints[self.wp_idx - 1])
+
+        dist_to_target = math.hypot(wp_target[0] - self.x,
+                                    wp_target[1] - self.y)
+        if dist_to_target < self.R_accept:
+            self.get_logger().info(
+                f'Reached WP {(self.wp_idx % 4) + 1} '
+                f'({wp_target[0]:.2f}, {wp_target[1]:.2f})')
+            self._advance_waypoint()
+            return
+
+        # ---- ILOS guidance -------------------------------------------------
+        alpha_k, x_e, y_e = self._path_errors(wp_prev, wp_target)
+        Delta = self._adaptive_lookahead(y_e)
+        psi_d = self._ilos_desired_heading(alpha_k, y_e, Delta, dt)
+
+        psi_err = wrap_angle(psi_d - self.psi)
+        r_cmd = self.K_psi * psi_err
+
+        U_cmd = self.U_d
+        is_final = (self.wp_idx == len(self.waypoints) - 1) and not self.loop_mode
+        if is_final and dist_to_target < self.brake_dist:
+            U_cmd = max(self.U_d * (dist_to_target / self.brake_dist),
+                        self.U_min)
+        U_cmd *= max(0.0, math.cos(psi_err))
+
+        # ---- Polygon boundary ----------------------------------------------
+        bound_factor = 1.0
+        min_wall_dist = float('inf')
+        if self.boundary is not None:
+            bound_factor, min_wall_dist, _ = self.boundary.speed_factor(
+                self.x, self.y, self.psi)
+            U_cmd *= bound_factor
+            if bound_factor <= 0.0:
+                self.get_logger().warn(
+                    f'OUTSIDE boundary! ({self.x:.2f}, {self.y:.2f})')
+            elif bound_factor < 1.0:
+                self.get_logger().info(
+                    f'Boundary: dist={min_wall_dist:.2f} m, '
+                    f'factor={bound_factor:.2f}')
+
+        # ---- Publish -------------------------------------------------------
+        cmd = Twist()
+        cmd.linear.x = float(U_cmd)
+        cmd.angular.z = float(r_cmd)
+        self.cmd_pub.publish(cmd)
+
+        # ---- Log -----------------------------------------------------------
+        if self.log_enabled and self.csv_file is not None:
+            t_sec = now.nanoseconds * 1e-9
+            self.csv_writer.writerow([
+                t_sec, self.x, self.y, self.psi, self.u, self.v,
+                self.wp_idx, wp_target[0], wp_target[1],
+                alpha_k, x_e, y_e,
+                Delta, self.y_int,
+                psi_d, psi_err, U_cmd, r_cmd,
+                bound_factor, min_wall_dist,
+            ])
+            self.csv_file.flush()
+
+    # ------------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------------
+
+    def destroy_node(self):
+        try:
+            self._publish_zero()
+        except Exception:
+            pass
+        if self.csv_file is not None:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
+        super().destroy_node()
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ILOSGuidance()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,72 @@
+{
+  "boundary_points": [
+    {
+      "x": -1.271,
+      "y": 1.612,
+      "direction_deg": 139.1
+    },
+    {
+      "x": 0.691,
+      "y": 1.46,
+      "direction_deg": 82.6
+    },
+    {
+      "x": 2.135,
+      "y": 1.845,
+      "direction_deg": 47.5
+    },
+    {
+      "x": 2.15,
+      "y": 1.347,
+      "direction_deg": 37.9
+    },
+    {
+      "x": 3.491,
+      "y": 1.243,
+      "direction_deg": 21.5
+    },
+    {
+      "x": 3.785,
+      "y": 0.877,
+      "direction_deg": 13.9
+    },
+    {
+      "x": 0.494,
+      "y": -1.885,
+      "direction_deg": 269.5
+    },
+    {
+      "x": 0.309,
+      "y": -1.799,
+      "direction_deg": 263.8
+    },
+    {
+      "x": 0.19,
+      "y": -1.896,
+      "direction_deg": 260.7
+    },
+    {
+      "x": -1.983,
+      "y": -1.397,
+      "direction_deg": 210.5
+    },
+    {
+      "x": -1.441,
+      "y": 0.892,
+      "direction_deg": 157.2
+    },
+    {
+      "x": -1.421,
+      "y": 0.897,
+      "direction_deg": 156.8
+    },
+    {
+      "x": -1.431,
+      "y": 0.936,
+      "direction_deg": 156.0
+    }
+  ],
+  "area_m2": 13.34,
+  "surface_z": 0.0,
+  "num_cameras": 3
+}

@@ -8,8 +8,8 @@ from geometry_msgs.msg import PoseStamped
 
 class MocapKeepalive(Node):
     def __init__(self):
-        super().__init__('mocap_keepalive')
-        self.pub = self.create_publisher(PoseStamped, '/mavros/vision_pose/pose', 10)
+        super().__init__('mocap_keepalive') # Name of the node
+        self.pub = self.create_publisher(PoseStamped, '/mavros/vision_pose/pose', 10) # Publishes the PoseStamped message to the topic
         self.create_timer(0.1, self.cb)
 
     def cb(self):

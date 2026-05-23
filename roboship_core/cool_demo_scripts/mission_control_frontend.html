@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>USV Mission Control</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;500;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    background: #0a0e17;
+    color: #c8d6e5;
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ──────────────────────────────────────── */
+  .sidebar {
+    width: 280px;
+    background: #0f1520;
+    border-right: 1px solid #1a2235;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    gap: 16px;
+  }
+
+  .logo {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #00e5a0;
+    text-transform: uppercase;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #1a2235;
+  }
+
+  .conn-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .conn-bar input {
+    flex: 1;
+    background: #141c2b;
+    border: 1px solid #1e2d44;
+    color: #c8d6e5;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+
+  .conn-bar button, .btn {
+    background: #1a2844;
+    border: 1px solid #243656;
+    color: #8ab4f8;
+    padding: 8px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: 'Outfit', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+
+  .btn:hover { background: #243656; }
+  .btn.primary { background: #00e5a0; color: #0a0e17; border-color: #00e5a0; font-weight: 700; }
+  .btn.primary:hover { background: #00cc8e; }
+  .btn.danger { background: #e74c3c; color: white; border-color: #e74c3c; }
+  .btn.danger:hover { background: #c0392b; }
+
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: #e74c3c;
+    flex-shrink: 0;
+  }
+  .status-dot.connected { background: #00e5a0; }
+
+  .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #5a6a80;
+    margin-top: 8px;
+  }
+
+  .telemetry {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    background: #141c2b;
+    border-radius: 8px;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 12px;
+  }
+
+  .telemetry .label { color: #5a6a80; }
+  .telemetry .value { color: #8ab4f8; text-align: right; }
+
+  .btn-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .btn-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn-row .btn { flex: 1; text-align: center; }
+
+  .mode-toggle {
+    display: flex;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid #243656;
+  }
+
+  .mode-toggle button {
+    flex: 1;
+    background: #141c2b;
+    border: none;
+    color: #5a6a80;
+    padding: 8px;
+    cursor: pointer;
+    font-family: 'Outfit', sans-serif;
+    font-size: 12px;
+    transition: all 0.15s;
+  }
+
+  .mode-toggle button.active {
+    background: #1a2844;
+    color: #00e5a0;
+  }
+
+  .wp-list {
+    flex: 1;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .wp-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background: #141c2b;
+    border-radius: 4px;
+  }
+
+  .wp-item .num { color: #00e5a0; }
+  .wp-item .coords { color: #8ab4f8; }
+
+  /* ── Canvas area ──────────────────────────────────── */
+  .canvas-area {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    position: relative;
+  }
+
+  canvas {
+    background: #0d1219;
+    border-radius: 12px;
+    border: 1px solid #1a2235;
+    cursor: crosshair;
+  }
+
+  .canvas-hint {
+    position: absolute;
+    bottom: 36px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 12px;
+    color: #3a4a60;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="logo">⚓ USV Control</div>
+
+  <div class="section-label">Connection</div>
+  <div class="conn-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <input id="wsUrl" value="ws://192.168.0.XXX:8765" />
+    <button class="btn" onclick="toggleConnect()" id="connBtn">Connect</button>
+  </div>
+
+  <div class="section-label">Telemetry</div>
+  <div class="telemetry">
+    <span class="label">X</span><span class="value" id="telX">—</span>
+    <span class="label">Y</span><span class="value" id="telY">—</span>
+    <span class="label">Yaw</span><span class="value" id="telYaw">—</span>
+    <span class="label">Rate</span><span class="value" id="telRate">—</span>
+  </div>
+
+  <div class="section-label">Click mode</div>
+  <div class="mode-toggle">
+    <button class="active" id="modeWaypoint" onclick="setMode('waypoint')">Waypoint</button>
+    <button id="modeTarget" onclick="setMode('target')">Target</button>
+  </div>
+
+  <div class="section-label">Mission</div>
+  <div class="btn-group">
+    <div class="btn-row">
+      <button class="btn primary" onclick="startMission()">Start</button>
+      <button class="btn danger" onclick="stopMission()">Stop</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn" onclick="undoWaypoint()">Undo</button>
+      <button class="btn" onclick="clearWaypoints()">Clear all</button>
+    </div>
+  </div>
+
+  <div class="section-label">Waypoints</div>
+  <div class="wp-list" id="wpList"></div>
+</div>
+
+<div class="canvas-area">
+  <canvas id="canvas"></canvas>
+  <div class="canvas-hint">Click to place waypoints · Scroll to zoom</div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────
+let ws = null;
+let connected = false;
+let clickMode = 'waypoint';
+let usv = { x: 0, y: 0, yaw: 0 };
+let trail = [];
+const MAX_TRAIL = 500;
+let waypoints = [];
+let boundary = [];
+let poseCount = 0;
+let lastRateCheck = Date.now();
+let poseRate = 0;
+
+// ── View transform ────────────────────────────────────
+// World coordinates: metres. Canvas: pixels.
+let viewCentreX = 0, viewCentreY = 0;
+let viewScale = 80; // pixels per metre
+
+// ── Canvas setup ──────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const area = document.querySelector('.canvas-area');
+  canvas.width = area.clientWidth - 48;
+  canvas.height = area.clientHeight - 48;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ── Coordinate conversion ─────────────────────────────
+function worldToCanvas(wx, wy) {
+  const cx = canvas.width / 2 + (wx - viewCentreX) * viewScale;
+  const cy = canvas.height / 2 - (wy - viewCentreY) * viewScale;
+  return [cx, cy];
+}
+
+function canvasToWorld(cx, cy) {
+  const wx = (cx - canvas.width / 2) / viewScale + viewCentreX;
+  const wy = -(cy - canvas.height / 2) / viewScale + viewCentreY;
+  return [wx, wy];
+}
+
+// ── Drawing ───────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Grid
+  drawGrid();
+
+  // Boundary polygon
+  if (boundary.length > 2) {
+    ctx.beginPath();
+    boundary.forEach((p, i) => {
+      const [cx, cy] = worldToCanvas(p.x, p.y);
+      if (i === 0) ctx.moveTo(cx, cy);
+      else ctx.lineTo(cx, cy);
+    });
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0, 229, 160, 0.05)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 229, 160, 0.3)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Trail
+  if (trail.length > 1) {
+    ctx.beginPath();
+    trail.forEach((p, i) => {
+      const [cx, cy] = worldToCanvas(p.x, p.y);
+      if (i === 0) ctx.moveTo(cx, cy);
+      else ctx.lineTo(cx, cy);
+    });
+    ctx.strokeStyle = 'rgba(138, 180, 248, 0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // Waypoints + path lines
+  if (waypoints.length > 0) {
+    // Path lines
+    ctx.beginPath();
+    waypoints.forEach((wp, i) => {
+      const [cx, cy] = worldToCanvas(wp.x, wp.y);
+      if (i === 0) ctx.moveTo(cx, cy);
+      else ctx.lineTo(cx, cy);
+    });
+    ctx.strokeStyle = 'rgba(255, 200, 50, 0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Waypoint markers
+    waypoints.forEach((wp, i) => {
+      const [cx, cy] = worldToCanvas(wp.x, wp.y);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.fillStyle = '#1a2844';
+      ctx.fill();
+      ctx.strokeStyle = '#ffc832';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffc832';
+      ctx.font = '600 11px JetBrains Mono';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(i + 1, cx, cy);
+    });
+  }
+
+  // USV
+  if (connected) {
+    const [cx, cy] = worldToCanvas(usv.x, usv.y);
+
+    // Heading line
+    const hLen = 20;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(-usv.yaw + Math.PI/2) * hLen,
+               cy - Math.sin(-usv.yaw + Math.PI/2) * hLen);
+    ctx.strokeStyle = '#00e5a0';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // USV body (triangle)
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-usv.yaw + Math.PI/2);
+    ctx.beginPath();
+    ctx.moveTo(0, -12);
+    ctx.lineTo(8, 8);
+    ctx.lineTo(-8, 8);
+    ctx.closePath();
+    ctx.fillStyle = '#00e5a0';
+    ctx.fill();
+    ctx.restore();
+
+    // Glow
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 25);
+    grad.addColorStop(0, 'rgba(0, 229, 160, 0.2)');
+    grad.addColorStop(1, 'rgba(0, 229, 160, 0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(cx - 25, cy - 25, 50, 50);
+  }
+
+  // Origin marker
+  const [ox, oy] = worldToCanvas(0, 0);
+  ctx.beginPath();
+  ctx.arc(ox, oy, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#3a4a60';
+  ctx.fill();
+
+  requestAnimationFrame(draw);
+}
+
+function drawGrid() {
+  const spacing = getGridSpacing();
+  const topLeft = canvasToWorld(0, 0);
+  const bottomRight = canvasToWorld(canvas.width, canvas.height);
+
+  const startX = Math.floor(topLeft[0] / spacing) * spacing;
+  const endX = Math.ceil(bottomRight[0] / spacing) * spacing;
+  const startY = Math.floor(bottomRight[1] / spacing) * spacing;
+  const endY = Math.ceil(topLeft[1] / spacing) * spacing;
+
+  ctx.strokeStyle = '#141c2b';
+  ctx.lineWidth = 1;
+
+  for (let x = startX; x <= endX; x += spacing) {
+    const [cx] = worldToCanvas(x, 0);
+    ctx.beginPath();
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, canvas.height);
+    ctx.stroke();
+  }
+  for (let y = startY; y <= endY; y += spacing) {
+    const [, cy] = worldToCanvas(0, y);
+    ctx.beginPath();
+    ctx.moveTo(0, cy);
+    ctx.lineTo(canvas.width, cy);
+    ctx.stroke();
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#2a3a50';
+  ctx.font = '10px JetBrains Mono';
+  ctx.textAlign = 'center';
+  for (let x = startX; x <= endX; x += spacing) {
+    const [cx] = worldToCanvas(x, 0);
+    ctx.fillText(x.toFixed(1) + 'm', cx, canvas.height - 4);
+  }
+  ctx.textAlign = 'left';
+  for (let y = startY; y <= endY; y += spacing) {
+    const [, cy] = worldToCanvas(0, y);
+    ctx.fillText(y.toFixed(1), 4, cy - 4);
+  }
+}
+
+function getGridSpacing() {
+  const pxPerMetre = viewScale;
+  if (pxPerMetre > 150) return 0.25;
+  if (pxPerMetre > 60) return 0.5;
+  if (pxPerMetre > 30) return 1;
+  if (pxPerMetre > 15) return 2;
+  return 5;
+}
+
+// ── Interaction ───────────────────────────────────────
+canvas.addEventListener('click', (e) => {
+  if (!connected) return;
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const [wx, wy] = canvasToWorld(cx, cy);
+
+  if (clickMode === 'waypoint') {
+    ws.send(JSON.stringify({ cmd: 'add_waypoint', x: wx, y: wy }));
+  } else {
+    ws.send(JSON.stringify({ cmd: 'set_target', x: wx, y: wy }));
+  }
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.9 : 1.1;
+  viewScale *= factor;
+  viewScale = Math.max(10, Math.min(400, viewScale));
+});
+
+// Pan with middle mouse or shift+click drag
+let panning = false, panStartX, panStartY;
+canvas.addEventListener('mousedown', (e) => {
+  if (e.button === 1 || e.shiftKey) {
+    panning = true;
+    panStartX = e.clientX;
+    panStartY = e.clientY;
+    e.preventDefault();
+  }
+});
+canvas.addEventListener('mousemove', (e) => {
+  if (!panning) return;
+  const dx = (e.clientX - panStartX) / viewScale;
+  const dy = (e.clientY - panStartY) / viewScale;
+  viewCentreX -= dx;
+  viewCentreY += dy;
+  panStartX = e.clientX;
+  panStartY = e.clientY;
+});
+canvas.addEventListener('mouseup', () => { panning = false; });
+
+// ── Connection ────────────────────────────────────────
+function toggleConnect() {
+  if (connected) {
+    ws.close();
+  } else {
+    const url = document.getElementById('wsUrl').value;
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      connected = true;
+      document.getElementById('statusDot').classList.add('connected');
+      document.getElementById('connBtn').textContent = 'Disconnect';
+    };
+
+    ws.onclose = () => {
+      connected = false;
+      document.getElementById('statusDot').classList.remove('connected');
+      document.getElementById('connBtn').textContent = 'Connect';
+    };
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+
+      if (data.type === 'pose') {
+        usv.x = data.x;
+        usv.y = data.y;
+        usv.yaw = data.yaw;
+
+        trail.push({ x: data.x, y: data.y });
+        if (trail.length > MAX_TRAIL) trail.shift();
+
+        poseCount++;
+        const now = Date.now();
+        if (now - lastRateCheck >= 1000) {
+          poseRate = poseCount;
+          poseCount = 0;
+          lastRateCheck = now;
+        }
+
+        // Update telemetry
+        document.getElementById('telX').textContent = data.x.toFixed(3);
+        document.getElementById('telY').textContent = data.y.toFixed(3);
+        document.getElementById('telYaw').textContent = (data.yaw * 180 / Math.PI).toFixed(1) + '°';
+        document.getElementById('telRate').textContent = poseRate + ' Hz';
+      }
+
+      if (data.type === 'boundary') {
+        boundary = data.points;
+      }
+
+      if (data.type === 'waypoints') {
+        waypoints = data.points;
+        updateWaypointList();
+      }
+    };
+  }
+}
+
+// ── UI helpers ────────────────────────────────────────
+function setMode(mode) {
+  clickMode = mode;
+  document.getElementById('modeWaypoint').classList.toggle('active', mode === 'waypoint');
+  document.getElementById('modeTarget').classList.toggle('active', mode === 'target');
+}
+
+function startMission() {
+  if (ws && connected) ws.send(JSON.stringify({ cmd: 'start_mission' }));
+}
+
+function stopMission() {
+  if (ws && connected) ws.send(JSON.stringify({ cmd: 'stop_mission' }));
+}
+
+function clearWaypoints() {
+  if (ws && connected) ws.send(JSON.stringify({ cmd: 'clear_waypoints' }));
+}
+
+function undoWaypoint() {
+  if (ws && connected) ws.send(JSON.stringify({ cmd: 'undo_waypoint' }));
+}
+
+function updateWaypointList() {
+  const list = document.getElementById('wpList');
+  list.innerHTML = waypoints.map((wp, i) =>
+    `<div class="wp-item">
+      <span class="num">#${i + 1}</span>
+      <span class="coords">(${wp.x.toFixed(2)}, ${wp.y.toFixed(2)})</span>
+    </div>`
+  ).join('');
+}
+
+// ── Start ─────────────────────────────────────────────
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
