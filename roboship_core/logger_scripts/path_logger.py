@@ -26,13 +26,7 @@ POSE_TOPIC = "/mavros/vision_pose/pose"   # change if using raw Qualisys topic
 CSV_DIR    = pathlib.Path.home() / "usv_logs"
 WS_PORT    = 8765                             # websocket port
 
-# Waypoints (x, y) in the same frame as mocap / EKF local position
-WAYPOINTS = [
-    (1.0, 1.0),
-    (4.0, 1.0),
-    (4.0, 4.0),
-    (1.0, 4.0),
-]
+
 
 # Tank boundary for the live viz (metres). Adjust to match your tank.
 TANK_X_MIN, TANK_X_MAX = -0.5, 5.0
@@ -98,7 +92,6 @@ class PathLogger(Node):
             "x": round(x, 4),
             "y": round(y, 4),
             "yaw": round(yaw, 2),
-            "waypoints": WAYPOINTS,
             "tank": [TANK_X_MIN, TANK_X_MAX, TANK_Y_MIN, TANK_Y_MAX],
         })
         # non-blocking push — actual send happens in the asyncio thread

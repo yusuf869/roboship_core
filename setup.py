@@ -39,6 +39,7 @@ setup(
             'post_run_process = roboship_core.logger_plotter_scripts.post_run_process:main',
             'LOS = roboship_core.navigation_scripts.LOS:main',
             'ILOS = roboship_core.navigation_scripts.ILOS:main',
+            'pure_pursuit = roboship_core.navigation_scripts.pure_pursuit:main',
         ],
     },
 )

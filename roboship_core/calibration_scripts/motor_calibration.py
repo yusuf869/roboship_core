@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 """
-Motor Auto-Calibration Node 
-─────────────────────────────────
-Automatically determines motor trim and pushes corrected SERVO
-parameters directly to the Pixhawk via MAVROS — no QGC needed.
+Motor Auto-Calibration Node (Simplified)
+─────────────────────────────────────────
+Drives the USV forward and reverse, measures heading drift from
+mocap, computes the percentage imbalance between left and right
+motors, and pushes corrected SERVO parameters to the Pixhawk.
+
+How it works:
+  1. WAIT — Wait for user to arm + set MANUAL mode
+  2. READ PARAMS — Read current SERVO9/10 MIN/MAX/TRIM from Pixhawk
+  3. FORWARD RUN — Drive forward, measure heading drift
+  4. REVERSE RUN — Drive reverse, measure heading drift
+  5. COMPUTE & APPLY — Express drift as a percentage motor imbalance,
+     scale the SERVO ranges accordingly, push to Pixhawk
+
+The percentage logic:
+  - Drive straight (steering centred) for a few seconds
+  - Record start heading and end heading from mocap
+  - Heading drift = end_heading − start_heading
+  - If the boat drifts RIGHT, the LEFT motor is stronger
+  - The drift angle over the run distance gives a percentage
+    imbalance: correction = drift_deg / RUN_DURATION scaled to
+    the SERVO range
+  - That percentage is applied to reduce the stronger motor's
+    SERVO range (MAX for forward, MIN for reverse)
 
 Safety: The script does NOT arm or change modes automatically.
-You must arm the vehicle and set MANUAL mode yourself (via transmitter
-or QGC). Once detected, the script navigates to the mocap origin
-and then begins calibration.
+You must arm the vehicle and set MANUAL mode yourself.
 
-Test sequence:
-  0. WAIT — Wait for user to arm + set MANUAL mode
-  0b. GO TO ORIGIN — Navigate to (0,0) in GUIDED mode
-  1. FORWARD STRAIGHT — Measure heading drift, find left/right imbalance
-  2. REVERSE STRAIGHT — Same in reverse (separate scaling)
-  3. SPEED MATCH — Adjust reverse throttle to match forward speed
-  4. SPIN TESTS — Verify CW/CCW symmetry and translational drift
-  5. APPLY — Compute new SERVO9/10 MIN/MAX/TRIM and push to Pixhawk
+All movement uses RC override on channel 0 (steering) and
+channel 2 (throttle) — the same proven approach used by the
+pure pursuit controller and all other working movement nodes.
 
 Output: ~/usv_logs/motor_calibration.json + params applied to Pixhawk.
 
 Prerequisites:
     - SYSID_MYGCS = 1, EKF3 sources = ExternalNav
     - Mocap pipeline running
-    - WP_SPEED ~0.2-0.3
+    - Vehicle in water with room to drive ~1m in each direction
 
 Usage:
     ros2 run roboship_core motor_calibration
@@ -37,19 +50,20 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
-from mavros_msgs.msg import OverrideRCIn, PositionTarget, State
-from mavros_msgs.srv import CommandBool, SetMode, ParamGet, ParamSet
+from mavros_msgs.msg import OverrideRCIn, State
+from mavros_msgs.srv import ParamGet, ParamSet
 from geographic_msgs.msg import GeoPointStamped
-from rcl_interfaces.msg import ParameterValue
 
 
 def yaw_from_quaternion(q):
+    """Extract yaw from quaternion (ENU frame)."""
     siny = 2.0 * (q.w * q.z + q.x * q.y)
     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny, cosy)
 
 
 def normalise_angle(a):
+    """Wrap angle to [-pi, pi]."""
     while a > math.pi:
         a -= 2 * math.pi
     while a < -math.pi:
@@ -60,78 +74,75 @@ def normalise_angle(a):
 class MotorCalibration(Node):
 
     # ── Tunables ────────────────────────────────────────────────
-    BASE_THROTTLE = 1560
-    REVERSE_THROTTLE = 1440
-    SPIN_THROTTLE = 1560
-    RUN_DURATION = 3.0
-    SPIN_DURATION = 4.0
-    SETTLE_TIME = 2.0
-    MAX_ITERATIONS = 10
-    HEADING_TOLERANCE = 2.0         # degrees
-    SPEED_TOLERANCE = 0.05          # m/s
-    TRIM_STEP = 0.02
-    ORIGIN_THRESHOLD = 0.3         # meters — how close to origin before starting
+    FWD_THROTTLE = 1560             # PWM for forward test
+    REV_THROTTLE = 1440             # PWM for reverse test
+    RUN_DURATION = 3.0              # seconds to drive per test
+    SETTLE_TIME  = 2.0              # seconds to wait between runs
+    HEADING_TOL_DEG = 2.0           # below this = "straight enough"
 
-    # Which SERVO outputs are your left and right motors
-    LEFT_SERVO = 'SERVO9'           # change if yours differ
+    # Max correction per run (prevents wild over-correction)
+    MAX_CORRECTION_PERCENT = 15.0
+
+    # Scaling: degrees-of-drift per second → percentage motor imbalance
+    # This is a tuning knob. At ~0.2 m/s with 60µs PWM range,
+    # 1°/s drift ≈ ~2% thrust imbalance. Adjust if corrections
+    # are too aggressive or too timid.
+    DRIFT_TO_PERCENT = 2.0
+
+    # Which SERVO outputs drive left and right motors
+    LEFT_SERVO  = 'SERVO9'
     RIGHT_SERVO = 'SERVO10'
-
-    # GUIDED position setpoint config
-    TYPE_MASK = 3580
-    COORD_FRAME = PositionTarget.FRAME_LOCAL_NED
 
     def __init__(self):
         super().__init__('motor_calibration')
 
-        # Calibration scaling factors (1.0 = no correction)
-        self.fwd_left_scale = 1.0
-        self.fwd_right_scale = 1.0
-        self.rev_left_scale = 1.0
-        self.rev_right_scale = 1.0
-        self.reverse_throttle_multiplier = 1.0
-
-        # State machine
+        # ── State machine ──────────────────────────────────────
         self.state = 'WAIT_FOR_ARM'
-        self.iteration = 0
         self.test_start_time = None
         self.start_yaw = None
         self.start_pos = None
         self.current_pose = None
         self.mavros_state = None
-        self.results = []
         self.last_wait_log = 0.0
         self.origin_set = False
 
-        # Speed measurement
-        self.forward_speed = None
-        self.reverse_speed = None
-
-        # Current SERVO params (read from Pixhawk)
+        # Results log
+        self.results = []
         self.servo_params = {}
+        self.new_params = {}
 
-        # Subscribers
+        # Drift measurements (degrees)
+        self.fwd_drift_deg = 0.0
+        self.rev_drift_deg = 0.0
+        self.fwd_distance  = 0.0
+        self.rev_distance  = 0.0
+
+        # ── Subscribers ────────────────────────────────────────
+        # BEST_EFFORT QoS — matches mocap pipeline and MAVROS defaults
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.create_subscription(PoseStamped, '/mavros/vision_pose/pose',
-                                 self.pose_cb, qos)
-        self.create_subscription(State, '/mavros/state', self.state_cb, 10)
+        self.create_subscription(
+            PoseStamped, '/mavros/vision_pose/pose', self.pose_cb, qos)
+        self.create_subscription(
+            State, '/mavros/state', self.state_cb, 10)
 
-        # Publishers
-        self.rc_pub = self.create_publisher(OverrideRCIn, '/mavros/rc/override', 10)
-        self.setpoint_pub = self.create_publisher(
-            PositionTarget, '/mavros/setpoint_raw/local', 10)
+        # ── Publishers ─────────────────────────────────────────
+        # RC override: channel 0 = steering, channel 2 = throttle
+        # This is the proven working movement method
+        self.rc_pub = self.create_publisher(
+            OverrideRCIn, '/mavros/rc/override', 10)
         self.origin_pub = self.create_publisher(
             GeoPointStamped, '/mavros/global_position/set_gp_origin', 10)
 
-        # Services
-        self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
-        self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
-        self.param_get_client = self.create_client(ParamGet, '/mavros/param/get')
-        self.param_set_client = self.create_client(ParamSet, '/mavros/param/set')
+        # ── Services ───────────────────────────────────────────
+        self.param_get_client = self.create_client(
+            ParamGet, '/mavros/param/get')
+        self.param_set_client = self.create_client(
+            ParamSet, '/mavros/param/set')
 
-        # Timers
-        self.timer = self.create_timer(0.05, self.loop)
+        # ── Timers ─────────────────────────────────────────────
+        self.timer = self.create_timer(0.05, self.loop)          # 20 Hz
         self.origin_timer = self.create_timer(1.0, self.publish_origin)
 
         self.get_logger().info('')
@@ -153,6 +164,8 @@ class MotorCalibration(Node):
         self.mavros_state = msg
 
     def publish_origin(self):
+        """Publish a dummy global origin so the EKF has a reference.
+        Stops once we have a pose (origin accepted)."""
         if self.origin_set:
             return
         msg = GeoPointStamped()
@@ -166,11 +179,19 @@ class MotorCalibration(Node):
             self.origin_timer.cancel()
             self.get_logger().info('  Global origin set.')
 
-    # ── Motor commands ──────────────────────────────────────────
+    # ── Motor commands (proven RC override pattern) ─────────────
+    #
+    #   Channel 0 = steering PWM   (1500 = centre)
+    #   Channel 2 = throttle PWM   (1500 = neutral)
+    #
+    #   ArduRover FRAME_CLASS=2 mixer converts these into
+    #   left/right motor PWM via SERVO9/10_FUNCTION = 73/74.
 
-    def send_differential(self, left_throttle, right_throttle):
-        throttle = (left_throttle + right_throttle) / 2.0
-        steering = (right_throttle - left_throttle) / 2.0
+    def send_rc(self, throttle, steering=0):
+        """Send RC override.
+        throttle: raw PWM (>1500 = forward, <1500 = reverse)
+        steering: offset from 1500 (+ = turn right, - = turn left)
+        """
         rc = OverrideRCIn()
         rc.channels = [0] * 18
         rc.channels[0] = max(1000, min(2000, 1500 + int(steering)))
@@ -178,41 +199,17 @@ class MotorCalibration(Node):
         self.rc_pub.publish(rc)
 
     def stop(self):
+        """Neutral throttle, centred steering."""
         rc = OverrideRCIn()
         rc.channels = [0] * 18
         rc.channels[0] = 1500
         rc.channels[2] = 1500
         self.rc_pub.publish(rc)
 
-    # ── Navigation to origin (GUIDED mode) ─────────────────────
-
-    def publish_position(self, east, north):
-        """Publish a position setpoint in ENU. MAVROS converts to NED."""
-        msg = PositionTarget()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.coordinate_frame = self.COORD_FRAME
-        msg.type_mask = self.TYPE_MASK
-        msg.position.x = float(east)
-        msg.position.y = float(north)
-        msg.position.z = 0.0
-        self.setpoint_pub.publish(msg)
-
-    def distance_to_origin(self):
-        if self.current_pose is None:
-            return float('inf')
-        pos = self.current_pose.pose.position
-        return math.sqrt(pos.x * pos.x + pos.y * pos.y)
-
-    def set_mode(self, mode):
-        """Request a mode change (non-blocking)."""
-        if self.mode_client.wait_for_service(timeout_sec=1.0):
-            req = SetMode.Request()
-            req.custom_mode = mode
-            self.mode_client.call_async(req)
-
-    # ── Helpers ─────────────────────────────────────────────────
+    # ── Measurement helpers ─────────────────────────────────────
 
     def record_start(self):
+        """Snapshot current heading and position at start of a run."""
         pos = self.current_pose.pose.position
         self.start_yaw = yaw_from_quaternion(self.current_pose.pose.orientation)
         self.start_pos = (pos.x, pos.y)
@@ -221,7 +218,8 @@ class MotorCalibration(Node):
     def elapsed(self):
         return self.get_clock().now().nanoseconds / 1e9 - self.test_start_time
 
-    def measure_drift_and_distance(self):
+    def measure_drift(self):
+        """Return (heading_drift_degrees, distance_travelled)."""
         pos = self.current_pose.pose.position
         yaw = yaw_from_quaternion(self.current_pose.pose.orientation)
         drift_deg = math.degrees(normalise_angle(yaw - self.start_yaw))
@@ -230,21 +228,11 @@ class MotorCalibration(Node):
         dist = math.sqrt(dx * dx + dy * dy)
         return drift_deg, dist
 
-    def measure_spin(self):
-        pos = self.current_pose.pose.position
-        yaw = yaw_from_quaternion(self.current_pose.pose.orientation)
-        total_yaw = normalise_angle(yaw - self.start_yaw)
-        dx = pos.x - self.start_pos[0]
-        dy = pos.y - self.start_pos[1]
-        trans_drift = math.sqrt(dx * dx + dy * dy)
-        yaw_rate = math.degrees(total_yaw) / self.SPIN_DURATION
-        return total_yaw, yaw_rate, trans_drift
-
     # ── Param read/write ───────────────────────────────────────
 
     def get_param(self, name):
         if not self.param_get_client.wait_for_service(timeout_sec=3.0):
-            self.get_logger().error(f'Param get service not available')
+            self.get_logger().error('Param get service not available')
             return None
         req = ParamGet.Request()
         req.param_id = name
@@ -258,7 +246,7 @@ class MotorCalibration(Node):
 
     def set_param(self, name, value):
         if not self.param_set_client.wait_for_service(timeout_sec=3.0):
-            self.get_logger().error(f'Param set service not available')
+            self.get_logger().error('Param set service not available')
             return False
         req = ParamSet.Request()
         req.param_id = name
@@ -273,6 +261,7 @@ class MotorCalibration(Node):
         return False
 
     def read_servo_params(self):
+        """Read current SERVO9/10 MIN, MAX, TRIM from Pixhawk."""
         params = {}
         for servo in [self.LEFT_SERVO, self.RIGHT_SERVO]:
             for suffix in ['_MIN', '_MAX', '_TRIM']:
@@ -283,50 +272,110 @@ class MotorCalibration(Node):
                     self.get_logger().info(f'  Read {name} = {val}')
                 else:
                     self.get_logger().warn(f'  Could not read {name} — using default')
-                    if '_MIN' in suffix:
-                        params[name] = 1000
-                    elif '_MAX' in suffix:
-                        params[name] = 2000
-                    else:
-                        params[name] = 1500
+                    default = {'_MIN': 1000, '_MAX': 2000, '_TRIM': 1500}
+                    params[name] = default[suffix]
         return params
 
-    def compute_new_servo_params(self):
-        p = self.servo_params
-        new_params = {}
-        for servo, fwd_s, rev_s in [
-            (self.LEFT_SERVO, self.fwd_left_scale, self.rev_left_scale),
-            (self.RIGHT_SERVO, self.fwd_right_scale, self.rev_right_scale),
-        ]:
+    # ── Correction computation ──────────────────────────────────
+
+    def compute_correction(self):
+        """
+        From the measured heading drift, compute new SERVO params.
+
+        Logic:
+          - Forward drift > 0 (drifted RIGHT) → left motor is stronger
+            → reduce LEFT SERVO_MAX (shrink its forward range)
+          - Forward drift < 0 (drifted LEFT) → right motor is stronger
+            → reduce RIGHT SERVO_MAX
+
+          - Reverse drift > 0 (drifted RIGHT) → right motor is stronger
+            in reverse → reduce RIGHT SERVO_MIN range
+          - Reverse drift < 0 (drifted LEFT) → left motor is stronger
+            in reverse → reduce LEFT SERVO_MIN range
+
+        The percentage correction is:
+          drift_rate = drift_deg / RUN_DURATION  (degrees per second)
+          correction_pct = drift_rate * DRIFT_TO_PERCENT
+          clamped to MAX_CORRECTION_PERCENT
+        """
+        p = dict(self.servo_params)  # copy
+        new = dict(p)
+
+        # ── Forward correction ──────────────────────────────
+        fwd_rate = self.fwd_drift_deg / self.RUN_DURATION
+        fwd_pct = fwd_rate * self.DRIFT_TO_PERCENT
+        fwd_pct = max(-self.MAX_CORRECTION_PERCENT,
+                      min(self.MAX_CORRECTION_PERCENT, fwd_pct))
+
+        self.get_logger().info(f'  Forward drift: {self.fwd_drift_deg:.1f}° '
+                               f'over {self.RUN_DURATION}s '
+                               f'= {fwd_rate:.2f}°/s '
+                               f'→ {fwd_pct:.1f}% imbalance')
+
+        if abs(fwd_pct) > 0.5:  # only correct if meaningful
+            if fwd_pct > 0:
+                # Drifted right → left motor too strong → shrink left forward range
+                servo = self.LEFT_SERVO
+            else:
+                # Drifted left → right motor too strong → shrink right forward range
+                servo = self.RIGHT_SERVO
+
             trim = p[f'{servo}_TRIM']
             old_max = p[f'{servo}_MAX']
-            old_min = p[f'{servo}_MIN']
             fwd_range = old_max - trim
-            rev_range = trim - old_min
-            new_max = int(trim + fwd_range * fwd_s)
-            new_min = int(trim - rev_range * rev_s * self.reverse_throttle_multiplier)
-            new_max = max(trim + 1, min(2200, new_max))
-            new_min = max(800, min(trim - 1, new_min))
-            new_params[f'{servo}_MAX'] = new_max
-            new_params[f'{servo}_MIN'] = new_min
-            new_params[f'{servo}_TRIM'] = trim
-        return new_params
+            reduction = int(fwd_range * abs(fwd_pct) / 100.0)
+            new_max = old_max - reduction
+            new_max = max(trim + 1, new_max)  # don't go below trim
+            new[f'{servo}_MAX'] = new_max
 
-    def apply_servo_params(self, new_params):
-        self.get_logger().info('')
-        self.get_logger().info('  Applying new SERVO parameters to Pixhawk...')
-        success = True
-        for name, value in new_params.items():
-            if not self.set_param(name, value):
-                success = False
-        return success
+            self.get_logger().info(
+                f'  → {servo}_MAX: {old_max} → {new_max} '
+                f'(reduced by {reduction} PWM)')
+        else:
+            self.get_logger().info('  → Forward drift within tolerance, no correction')
+
+        # ── Reverse correction ──────────────────────────────
+        rev_rate = self.rev_drift_deg / self.RUN_DURATION
+        rev_pct = rev_rate * self.DRIFT_TO_PERCENT
+        rev_pct = max(-self.MAX_CORRECTION_PERCENT,
+                      min(self.MAX_CORRECTION_PERCENT, rev_pct))
+
+        self.get_logger().info(f'  Reverse drift: {self.rev_drift_deg:.1f}° '
+                               f'over {self.RUN_DURATION}s '
+                               f'= {rev_rate:.2f}°/s '
+                               f'→ {rev_pct:.1f}% imbalance')
+
+        if abs(rev_pct) > 0.5:
+            if rev_pct > 0:
+                # Drifted right in reverse → right motor stronger in reverse
+                # → shrink right reverse range (increase MIN towards trim)
+                servo = self.RIGHT_SERVO
+            else:
+                # Drifted left in reverse → left motor stronger in reverse
+                servo = self.LEFT_SERVO
+
+            trim = p[f'{servo}_TRIM']
+            old_min = new.get(f'{servo}_MIN', p[f'{servo}_MIN'])
+            rev_range = trim - old_min
+            reduction = int(rev_range * abs(rev_pct) / 100.0)
+            new_min = old_min + reduction
+            new_min = min(trim - 1, new_min)  # don't go above trim
+            new[f'{servo}_MIN'] = new_min
+
+            self.get_logger().info(
+                f'  → {servo}_MIN: {old_min} → {new_min} '
+                f'(increased by {reduction} PWM)')
+        else:
+            self.get_logger().info('  → Reverse drift within tolerance, no correction')
+
+        return new
 
     # ── State machine ──────────────────────────────────────────
 
     def loop(self):
         now = self.get_clock().now().nanoseconds / 1e9
 
-        # ── PHASE 0: WAIT FOR USER TO ARM ──────────────────
+        # ── WAIT FOR ARM + MANUAL ──────────────────────────
 
         if self.state == 'WAIT_FOR_ARM':
             if self.mavros_state is None or self.current_pose is None:
@@ -350,63 +399,31 @@ class MotorCalibration(Node):
                         f'  Mode is MANUAL ✓ — Please arm the vehicle')
                 elif mode != 'MANUAL':
                     self.get_logger().info(
-                        f'  Armed ✓ — Please switch to MANUAL mode (current: {mode})')
+                        f'  Armed ✓ — Please switch to MANUAL mode '
+                        f'(current: {mode})')
 
             if (self.mavros_state.connected
                     and self.mavros_state.armed
                     and self.mavros_state.mode == 'MANUAL'):
                 self.get_logger().info('  ✓ Armed in MANUAL mode — detected!')
-                self.get_logger().info('  Switching to GUIDED to navigate to origin...')
-                self.set_mode('GUIDED')
-                self.test_start_time = now
-                self.state = 'GOTO_ORIGIN_WAIT_MODE'
+                self.get_logger().info('  Reading SERVO parameters...')
+                self.state = 'READ_PARAMS'
             return
 
-        # ── PHASE 0b: NAVIGATE TO ORIGIN ───────────────────
+        # ── READ CURRENT SERVO PARAMS ──────────────────────
 
-        if self.state == 'GOTO_ORIGIN_WAIT_MODE':
-            if self.mavros_state.mode == 'GUIDED':
-                dist = self.distance_to_origin()
-                self.get_logger().info(
-                    f'  In GUIDED mode — navigating to origin '
-                    f'(currently {dist:.2f}m away)')
-                self.state = 'GOTO_ORIGIN'
-            elif (now - self.test_start_time) > 5.0:
-                self.get_logger().warn('  Failed to switch to GUIDED — retrying...')
-                self.set_mode('GUIDED')
-                self.test_start_time = now
+        if self.state == 'READ_PARAMS':
+            self.servo_params = self.read_servo_params()
+            self.get_logger().info('')
+            self.get_logger().info('  Settling before forward run...')
+            self.test_start_time = now
+            self.state = 'PRE_FWD_SETTLE'
             return
 
-        if self.state == 'GOTO_ORIGIN':
-            # Publish (0,0) position setpoint — L1 controller handles it
-            self.publish_position(0.0, 0.0)
-            dist = self.distance_to_origin()
-
-            if now - self.last_wait_log > 3.0:
-                self.last_wait_log = now
-                self.get_logger().info(f'  Navigating to origin... {dist:.2f}m away')
-
-            if dist < self.ORIGIN_THRESHOLD:
-                self.get_logger().info(f'  ✓ At origin ({dist:.2f}m)')
-                self.get_logger().info('  Switching to MANUAL for calibration...')
-                self.stop()
-                self.set_mode('MANUAL')
-                self.test_start_time = now
-                self.state = 'ORIGIN_SETTLE'
-            return
-
-        if self.state == 'ORIGIN_SETTLE':
-            if self.mavros_state.mode == 'MANUAL':
-                if (now - self.test_start_time) >= self.SETTLE_TIME:
-                    self.state = 'FWD_STRAIGHT_START'
-                    self.iteration = 0
-                    self.get_logger().info('')
-                    self.get_logger().info('=' * 50)
-                    self.get_logger().info('  CALIBRATION STARTING')
-                    self.get_logger().info('=' * 50)
-            elif (now - self.test_start_time) > 5.0:
-                self.set_mode('MANUAL')
-                self.test_start_time = now
+        if self.state == 'PRE_FWD_SETTLE':
+            self.stop()
+            if (now - self.test_start_time) >= self.SETTLE_TIME:
+                self.state = 'FWD_START'
             return
 
         # ── Safety: abort if disarmed during calibration ───
@@ -422,279 +439,170 @@ class MotorCalibration(Node):
         if self.current_pose is None:
             return
 
-        # ── PHASE 1: FORWARD STRAIGHT ──────────────────────
+        # ── FORWARD RUN ────────────────────────────────────
+        #
+        #  Drive forward with centred steering. The skid-steer
+        #  mixer in ArduRover converts throttle+steering to
+        #  left/right motor PWM. If the motors aren't matched,
+        #  the heading will drift.
 
-        if self.state == 'FWD_STRAIGHT_START':
-            self.iteration += 1
-            if self.iteration > self.MAX_ITERATIONS:
-                self.get_logger().warn('Forward calibration did not converge')
-                self.state = 'REV_STRAIGHT_START'
-                self.iteration = 0
-                return
-            self.get_logger().info(
-                f'[FWD {self.iteration}] L={self.fwd_left_scale:.3f} R={self.fwd_right_scale:.3f}')
-            self.record_start()
-            self.state = 'FWD_STRAIGHT_RUN'
-
-        elif self.state == 'FWD_STRAIGHT_RUN':
-            if self.elapsed() < self.RUN_DURATION:
-                offset = self.BASE_THROTTLE - 1500
-                left = 1500 + offset * self.fwd_left_scale
-                right = 1500 + offset * self.fwd_right_scale
-                self.send_differential(left, right)
-            else:
-                self.stop()
-                self.test_start_time = now
-                self.state = 'FWD_STRAIGHT_SETTLE'
-
-        elif self.state == 'FWD_STRAIGHT_SETTLE':
-            if (now - self.test_start_time) >= self.SETTLE_TIME:
-                self.state = 'FWD_STRAIGHT_ANALYSE'
-
-        elif self.state == 'FWD_STRAIGHT_ANALYSE':
-            drift_deg, dist = self.measure_drift_and_distance()
-            self.forward_speed = dist / self.RUN_DURATION
-            self.results.append({
-                'test': 'forward_straight', 'iteration': self.iteration,
-                'heading_drift_deg': round(drift_deg, 2),
-                'distance_m': round(dist, 3),
-                'left_scale': round(self.fwd_left_scale, 4),
-                'right_scale': round(self.fwd_right_scale, 4),
-            })
-            self.get_logger().info(f'  Drift: {drift_deg:.1f}°  Dist: {dist:.2f}m')
-            if abs(drift_deg) < self.HEADING_TOLERANCE:
-                self.get_logger().info('  ✓ Forward converged!')
-                self.state = 'REV_STRAIGHT_START'
-                self.iteration = 0
-                return
-            if drift_deg > 0:
-                self.fwd_left_scale -= self.TRIM_STEP
-            else:
-                self.fwd_right_scale -= self.TRIM_STEP
-            self.state = 'FWD_STRAIGHT_START'
-
-        # ── PHASE 2: REVERSE STRAIGHT ──────────────────────
-
-        elif self.state == 'REV_STRAIGHT_START':
-            self.iteration += 1
-            if self.iteration > self.MAX_ITERATIONS:
-                self.get_logger().warn('Reverse calibration did not converge')
-                self.state = 'SPEED_MATCH_FWD'
-                self.iteration = 0
-                return
-            self.get_logger().info(
-                f'[REV {self.iteration}] L={self.rev_left_scale:.3f} R={self.rev_right_scale:.3f}')
-            self.record_start()
-            self.state = 'REV_STRAIGHT_RUN'
-
-        elif self.state == 'REV_STRAIGHT_RUN':
-            if self.elapsed() < self.RUN_DURATION:
-                offset = 1500 - self.REVERSE_THROTTLE
-                left = 1500 - offset * self.rev_left_scale
-                right = 1500 - offset * self.rev_right_scale
-                self.send_differential(left, right)
-            else:
-                self.stop()
-                self.test_start_time = now
-                self.state = 'REV_STRAIGHT_SETTLE'
-
-        elif self.state == 'REV_STRAIGHT_SETTLE':
-            if (now - self.test_start_time) >= self.SETTLE_TIME:
-                self.state = 'REV_STRAIGHT_ANALYSE'
-
-        elif self.state == 'REV_STRAIGHT_ANALYSE':
-            drift_deg, dist = self.measure_drift_and_distance()
-            self.reverse_speed = dist / self.RUN_DURATION
-            self.results.append({
-                'test': 'reverse_straight', 'iteration': self.iteration,
-                'heading_drift_deg': round(drift_deg, 2),
-                'distance_m': round(dist, 3),
-                'left_scale': round(self.rev_left_scale, 4),
-                'right_scale': round(self.rev_right_scale, 4),
-            })
-            self.get_logger().info(f'  Drift: {drift_deg:.1f}°  Dist: {dist:.2f}m')
-            if abs(drift_deg) < self.HEADING_TOLERANCE:
-                self.get_logger().info('  ✓ Reverse converged!')
-                self.state = 'SPEED_MATCH_FWD'
-                self.iteration = 0
-                return
-            if drift_deg > 0:
-                self.rev_left_scale -= self.TRIM_STEP
-            else:
-                self.rev_right_scale -= self.TRIM_STEP
-            self.state = 'REV_STRAIGHT_START'
-
-        # ── PHASE 3: SPEED MATCHING ────────────────────────
-
-        elif self.state == 'SPEED_MATCH_FWD':
-            self.get_logger().info('[SPEED MATCH] Measuring forward speed...')
-            self.record_start()
-            self.state = 'SPEED_MATCH_FWD_RUN'
-
-        elif self.state == 'SPEED_MATCH_FWD_RUN':
-            if self.elapsed() < self.RUN_DURATION:
-                offset = self.BASE_THROTTLE - 1500
-                left = 1500 + offset * self.fwd_left_scale
-                right = 1500 + offset * self.fwd_right_scale
-                self.send_differential(left, right)
-            else:
-                self.stop()
-                _, dist = self.measure_drift_and_distance()
-                self.forward_speed = dist / self.RUN_DURATION
-                self.get_logger().info(f'  Forward speed: {self.forward_speed:.3f} m/s')
-                self.test_start_time = now
-                self.state = 'SPEED_MATCH_FWD_SETTLE'
-
-        elif self.state == 'SPEED_MATCH_FWD_SETTLE':
-            if (now - self.test_start_time) >= self.SETTLE_TIME:
-                self.state = 'SPEED_MATCH_REV'
-
-        elif self.state == 'SPEED_MATCH_REV':
-            self.iteration += 1
-            if self.iteration > self.MAX_ITERATIONS:
-                self.get_logger().warn('Speed matching did not converge')
-                self.state = 'SPIN_START'
-                self.iteration = 0
-                return
-            self.get_logger().info(
-                f'[SPEED REV {self.iteration}] mult={self.reverse_throttle_multiplier:.3f}')
-            self.record_start()
-            self.state = 'SPEED_MATCH_REV_RUN'
-
-        elif self.state == 'SPEED_MATCH_REV_RUN':
-            if self.elapsed() < self.RUN_DURATION:
-                base_offset = 1500 - self.REVERSE_THROTTLE
-                adj = base_offset * self.reverse_throttle_multiplier
-                left = 1500 - adj * self.rev_left_scale
-                right = 1500 - adj * self.rev_right_scale
-                self.send_differential(left, right)
-            else:
-                self.stop()
-                _, dist = self.measure_drift_and_distance()
-                self.reverse_speed = dist / self.RUN_DURATION
-                self.test_start_time = now
-                self.state = 'SPEED_MATCH_REV_SETTLE'
-
-        elif self.state == 'SPEED_MATCH_REV_SETTLE':
-            if (now - self.test_start_time) >= self.SETTLE_TIME:
-                self.state = 'SPEED_MATCH_ANALYSE'
-
-        elif self.state == 'SPEED_MATCH_ANALYSE':
-            diff = self.forward_speed - self.reverse_speed
-            self.results.append({
-                'test': 'speed_match', 'iteration': self.iteration,
-                'forward_speed': round(self.forward_speed, 4),
-                'reverse_speed': round(self.reverse_speed, 4),
-                'multiplier': round(self.reverse_throttle_multiplier, 4),
-            })
-            self.get_logger().info(
-                f'  Rev: {self.reverse_speed:.3f} m/s (fwd: {self.forward_speed:.3f}, diff: {diff:.3f})')
-            if abs(diff) < self.SPEED_TOLERANCE:
-                self.get_logger().info('  ✓ Speed match converged!')
-                self.state = 'SPIN_START'
-                self.iteration = 0
-                return
-            if self.reverse_speed < self.forward_speed:
-                self.reverse_throttle_multiplier += 0.05
-            else:
-                self.reverse_throttle_multiplier -= 0.05
-            self.state = 'SPEED_MATCH_REV'
-
-        # ── PHASE 4: SPIN TESTS ────────────────────────────
-
-        elif self.state == 'SPIN_START':
-            self.iteration += 1
-            if self.iteration > 2:
-                self.state = 'READ_PARAMS'
-                return
-            direction = 'CW' if self.iteration == 1 else 'CCW'
-            self.get_logger().info(f'[SPIN {direction}]')
-            self.record_start()
-            self.state = 'SPIN_RUN'
-
-        elif self.state == 'SPIN_RUN':
-            if self.elapsed() < self.SPIN_DURATION:
-                offset = self.SPIN_THROTTLE - 1500
-                if self.iteration == 1:
-                    left = 1500 + offset * self.fwd_left_scale
-                    right = 1500 - offset * self.reverse_throttle_multiplier * self.rev_right_scale
-                else:
-                    left = 1500 - offset * self.reverse_throttle_multiplier * self.rev_left_scale
-                    right = 1500 + offset * self.fwd_right_scale
-                self.send_differential(left, right)
-            else:
-                self.stop()
-                self.test_start_time = now
-                self.state = 'SPIN_SETTLE'
-
-        elif self.state == 'SPIN_SETTLE':
-            if (now - self.test_start_time) >= self.SETTLE_TIME:
-                self.state = 'SPIN_ANALYSE'
-
-        elif self.state == 'SPIN_ANALYSE':
-            total_yaw, yaw_rate, trans_drift = self.measure_spin()
-            direction = 'CW' if self.iteration == 1 else 'CCW'
-            self.results.append({
-                'test': f'spin_{direction}',
-                'total_yaw_deg': round(math.degrees(total_yaw), 2),
-                'avg_yaw_rate_dps': round(yaw_rate, 2),
-                'translational_drift_m': round(trans_drift, 4),
-            })
-            self.get_logger().info(
-                f'  Yaw: {math.degrees(total_yaw):.1f}° ({yaw_rate:.1f}°/s)  '
-                f'Drift: {trans_drift:.3f}m')
-            self.state = 'SPIN_START'
-
-        # ── PHASE 5: READ CURRENT PARAMS & APPLY ───────────
-
-        elif self.state == 'READ_PARAMS':
-            self.stop()
+        if self.state == 'FWD_START':
             self.get_logger().info('')
-            self.get_logger().info('  Reading current SERVO parameters from Pixhawk...')
-            self.servo_params = self.read_servo_params()
+            self.get_logger().info('=' * 50)
+            self.get_logger().info('  FORWARD TEST')
+            self.get_logger().info('=' * 50)
+            self.record_start()
+            self.state = 'FWD_RUN'
+
+        elif self.state == 'FWD_RUN':
+            if self.elapsed() < self.RUN_DURATION:
+                # Straight forward — steering centred at 0
+                self.send_rc(throttle=self.FWD_THROTTLE, steering=0)
+            else:
+                self.stop()
+                self.fwd_drift_deg, self.fwd_distance = self.measure_drift()
+                fwd_speed = self.fwd_distance / self.RUN_DURATION
+                self.get_logger().info(
+                    f'  Heading drift: {self.fwd_drift_deg:+.1f}°')
+                self.get_logger().info(
+                    f'  Distance:      {self.fwd_distance:.3f}m '
+                    f'({fwd_speed:.3f} m/s)')
+                self.results.append({
+                    'test': 'forward',
+                    'drift_deg': round(self.fwd_drift_deg, 2),
+                    'distance_m': round(self.fwd_distance, 3),
+                    'speed_ms': round(fwd_speed, 4),
+                    'throttle_pwm': self.FWD_THROTTLE,
+                })
+                self.test_start_time = now
+                self.state = 'FWD_SETTLE'
+
+        elif self.state == 'FWD_SETTLE':
+            self.stop()
+            if (now - self.test_start_time) >= self.SETTLE_TIME:
+                self.state = 'REV_START'
+
+        # ── REVERSE RUN ────────────────────────────────────
+
+        elif self.state == 'REV_START':
+            self.get_logger().info('')
+            self.get_logger().info('=' * 50)
+            self.get_logger().info('  REVERSE TEST')
+            self.get_logger().info('=' * 50)
+            self.record_start()
+            self.state = 'REV_RUN'
+
+        elif self.state == 'REV_RUN':
+            if self.elapsed() < self.RUN_DURATION:
+                # Straight reverse — steering centred at 0
+                self.send_rc(throttle=self.REV_THROTTLE, steering=0)
+            else:
+                self.stop()
+                self.rev_drift_deg, self.rev_distance = self.measure_drift()
+                rev_speed = self.rev_distance / self.RUN_DURATION
+                self.get_logger().info(
+                    f'  Heading drift: {self.rev_drift_deg:+.1f}°')
+                self.get_logger().info(
+                    f'  Distance:      {self.rev_distance:.3f}m '
+                    f'({rev_speed:.3f} m/s)')
+                self.results.append({
+                    'test': 'reverse',
+                    'drift_deg': round(self.rev_drift_deg, 2),
+                    'distance_m': round(self.rev_distance, 3),
+                    'speed_ms': round(rev_speed, 4),
+                    'throttle_pwm': self.REV_THROTTLE,
+                })
+                self.test_start_time = now
+                self.state = 'REV_SETTLE'
+
+        elif self.state == 'REV_SETTLE':
+            self.stop()
+            if (now - self.test_start_time) >= self.SETTLE_TIME:
+                self.state = 'COMPUTE'
+
+        # ── COMPUTE & APPLY ────────────────────────────────
+
+        elif self.state == 'COMPUTE':
+            self.get_logger().info('')
+            self.get_logger().info('=' * 50)
+            self.get_logger().info('  COMPUTING CORRECTIONS')
+            self.get_logger().info('=' * 50)
+
+            self.new_params = self.compute_correction()
+
+            # Show what changed
+            self.get_logger().info('')
+            self.get_logger().info('  New SERVO parameters:')
+            changed = False
+            for name in sorted(self.new_params.keys()):
+                old = self.servo_params.get(name, '?')
+                new = self.new_params[name]
+                marker = ' ✓' if old != new else ''
+                self.get_logger().info(
+                    f'    {name}: {old} → {new}{marker}')
+                if old != new:
+                    changed = True
+
+            if not changed:
+                self.get_logger().info('')
+                self.get_logger().info('  No corrections needed — motors are '
+                                       'within tolerance!')
+                self.state = 'SAVE_RESULTS'
+                return
+
             self.state = 'APPLY_PARAMS'
 
         elif self.state == 'APPLY_PARAMS':
-            new_params = self.compute_new_servo_params()
-
             self.get_logger().info('')
-            self.get_logger().info('  Computed new SERVO parameters:')
-            for name, val in sorted(new_params.items()):
-                old = self.servo_params.get(name, '?')
-                self.get_logger().info(f'    {name}: {old} → {val}')
-
-            success = self.apply_servo_params(new_params)
+            self.get_logger().info('  Applying to Pixhawk...')
+            success = True
+            for name, value in self.new_params.items():
+                old = self.servo_params.get(name)
+                if old != value:
+                    if not self.set_param(name, value):
+                        success = False
 
             if success:
-                self.get_logger().info('  ✓ Parameters applied to Pixhawk')
+                self.get_logger().info('  ✓ Parameters applied')
             else:
-                self.get_logger().warn('  Some parameters failed to apply — check manually')
+                self.get_logger().warn('  Some parameters failed — check manually')
 
             self.state = 'SAVE_RESULTS'
-            self.new_params = new_params
+
+        # ── SAVE & FINISH ──────────────────────────────────
 
         elif self.state == 'SAVE_RESULTS':
+            self.stop()
+
+            # ── Summary ────────────────────────────────────
             self.get_logger().info('')
             self.get_logger().info('=' * 50)
             self.get_logger().info('  CALIBRATION COMPLETE')
             self.get_logger().info('=' * 50)
-            self.get_logger().info(f'  Forward:  L={self.fwd_left_scale:.4f}  R={self.fwd_right_scale:.4f}')
-            self.get_logger().info(f'  Reverse:  L={self.rev_left_scale:.4f}  R={self.rev_right_scale:.4f}')
-            self.get_logger().info(f'  Reverse multiplier: {self.reverse_throttle_multiplier:.4f}')
+            self.get_logger().info(
+                f'  Forward drift: {self.fwd_drift_deg:+.1f}° '
+                f'over {self.fwd_distance:.2f}m')
+            self.get_logger().info(
+                f'  Reverse drift: {self.rev_drift_deg:+.1f}° '
+                f'over {self.rev_distance:.2f}m')
 
+            # ── Save JSON ──────────────────────────────────
             out_path = pathlib.Path.home() / 'usv_logs' / 'motor_calibration.json'
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
             calibration = {
-                'scaling_factors': {
+                'measurements': {
                     'forward': {
-                        'left_scale': round(self.fwd_left_scale, 4),
-                        'right_scale': round(self.fwd_right_scale, 4),
+                        'drift_deg': round(self.fwd_drift_deg, 2),
+                        'distance_m': round(self.fwd_distance, 3),
+                        'throttle_pwm': self.FWD_THROTTLE,
+                        'run_duration_s': self.RUN_DURATION,
                     },
                     'reverse': {
-                        'left_scale': round(self.rev_left_scale, 4),
-                        'right_scale': round(self.rev_right_scale, 4),
-                        'throttle_multiplier': round(self.reverse_throttle_multiplier, 4),
+                        'drift_deg': round(self.rev_drift_deg, 2),
+                        'distance_m': round(self.rev_distance, 3),
+                        'throttle_pwm': self.REV_THROTTLE,
+                        'run_duration_s': self.RUN_DURATION,
                     },
                 },
                 'servo_params': {
@@ -702,9 +610,12 @@ class MotorCalibration(Node):
                     'calibrated': self.new_params,
                 },
                 'qgc_summary': {
-                    'description': 'These values have been auto-applied to the Pixhawk. '
-                                   'Verify in QGC under Parameters if needed.',
-                    **self.new_params,
+                    'description':
+                        'These values have been auto-applied to the Pixhawk '
+                        '(RAM only). Verify in QGC under Parameters and '
+                        'save permanently if happy.',
+                    **{k: v for k, v in self.new_params.items()
+                       if v != self.servo_params.get(k)},
                 },
                 'tests': self.results,
             }
@@ -712,27 +623,31 @@ class MotorCalibration(Node):
                 json.dump(calibration, f, indent=2)
             self.get_logger().info(f'  Saved to {out_path}')
 
+            # ── QGC reminder box ───────────────────────────
             self.get_logger().info('')
             self.get_logger().info('╔' + '═' * 58 + '╗')
-            self.get_logger().info('║  VALUES AUTO-APPLIED TO PIXHAWK (in RAM only)           ║')
-            self.get_logger().info('║  Please verify and save permanently in QGroundControl    ║')
+            self.get_logger().info(
+                '║  VALUES AUTO-APPLIED TO PIXHAWK (in RAM only)           ║')
+            self.get_logger().info(
+                '║  Please verify and save permanently in QGroundControl    ║')
             self.get_logger().info('╠' + '═' * 58 + '╣')
-            self.get_logger().info('║                                                          ║')
-            self.get_logger().info('║  Open QGC → Parameters → search for each param below.   ║')
-            self.get_logger().info('║  Confirm the values match, then click "Save to Vehicle"  ║')
-            self.get_logger().info('║  to write them permanently to EEPROM.                    ║')
-            self.get_logger().info('║                                                          ║')
+            self.get_logger().info(
+                '║                                                          ║')
             for name in sorted(self.new_params.keys()):
                 old = self.servo_params.get(name, '?')
                 new = self.new_params[name]
-                line = f'║  {name:<14}  {old:>5}  →  {new:>5}'
-                line = line.ljust(60) + '║'
-                self.get_logger().info(line)
-            self.get_logger().info('║                                                          ║')
-            self.get_logger().info('║  These values are in RAM only and will be lost on        ║')
-            self.get_logger().info('║  reboot unless you save them in QGC!                     ║')
-            self.get_logger().info('║                                                          ║')
-            self.get_logger().info('╚' + '═' * 58 + '╝')
+                if old != new:
+                    line = f'║  {name:<14}  {old:>5}  →  {new:>5}'
+                    line = line.ljust(60) + '║'
+                    self.get_logger().info(line)
+            self.get_logger().info(
+                '║                                                          ║')
+            self.get_logger().info(
+                '║  These values are in RAM only and will be lost on        ║')
+            self.get_logger().info(
+                '║  reboot unless you save them in QGC!                     ║')
+            self.get_logger().info(
+                '╚' + '═' * 58 + '╝')
 
             self.state = 'FINISHED'
             self.timer.cancel()
